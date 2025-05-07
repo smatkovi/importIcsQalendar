@@ -1,90 +1,129 @@
-import os
 import sys
 import sqlite3
-import datetime
-from icalendar import Calendar
+import time
+from datetime import datetime, timedelta, date, time as dtime
+from zoneinfo import ZoneInfo
+from pathlib import Path
 
-DB_PATH = os.path.expanduser("~/.calendar/calendardb")
 
-TYPE_MAP = {
-    "VEVENT": 1,
-    "VTODO": 2,
-    "VJOURNAL": 3,
-}
+from icalendar import Calendar, Event
+from dateutil.rrule import rrulestr
+from dateutil.tz import gettz
 
-def parse_ics(file_path):
-    with open(file_path, "rb") as f:
-        cal = Calendar.from_ical(f.read())
+DB_PATH = str(Path.home() / ".calendar" / "calendardb")
+TIMEZONE = ZoneInfo("Europe/Vienna")
 
-    events = []
+def parse_ics(path):
+    with open(path, "rb") as f:
+        return Calendar.from_ical(f.read())
+
+def expand_recurring_events(cal):
+    instances = []
+
     for component in cal.walk():
-        if component.name not in TYPE_MAP:
+        if component.name != "VEVENT":
             continue
 
-        uid = str(component.get("UID", ""))
+        uid = str(component.get("UID"))
         summary = str(component.get("SUMMARY", ""))
         location = str(component.get("LOCATION", ""))
         description = str(component.get("DESCRIPTION", ""))
-        dtstart = component.get("DTSTART")
-        dtend = component.get("DTEND") or dtstart
+        tzinfo = TIMEZONE
 
-        # Convert datetime.date to datetime.datetime if needed
-        if hasattr(dtstart.dt, "timestamp"):
-            start_ts = int(dtstart.dt.timestamp())
+        dtstart = component.get("DTSTART").dt
+        dtend = component.get("DTEND").dt if component.get("DTEND") else dtstart
+
+        if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
+            dtstart = datetime.combine(dtstart, dtime.min)
+        if isinstance(dtend, date) and not isinstance(dtend, datetime):
+            dtend = datetime.combine(dtend, dtime.min)
+
+        dtstart = dtstart.replace(tzinfo=tzinfo)
+        dtend = dtend.replace(tzinfo=tzinfo)
+
+        rrule_raw = component.get("RRULE")
+        if rrule_raw:
+            try:
+                print(f"🌀 Recurring: {summary}")
+                rule = rrulestr(str(rrule_raw.to_ical().decode()), dtstart=dtstart)
+                exdates = component.get("EXDATE")
+                exclusions = set()
+                if exdates:
+                    if not isinstance(exdates, list):
+                        exdates = [exdates]
+                    for ex in exdates:
+                        for exval in ex.dts:
+                            exclusions.add(exval.dt.replace(tzinfo=tzinfo))
+
+                for recur_dt in rule:
+                    if recur_dt in exclusions:
+                        continue
+                    duration = dtend - dtstart
+                    instances.append({
+                        "uid": f"{uid}-{int(recur_dt.timestamp())}",
+                        "summary": summary,
+                        "location": location,
+                        "description": description,
+                        "start": recur_dt,
+                        "end": recur_dt + duration,
+                    })
+            except Exception as e:
+                print(f"⚠️  Failed to expand recurrence: {e}")
         else:
-            start_ts = int(datetime.datetime.combine(dtstart.dt, datetime.time()).timestamp())
+            instances.append({
+                "uid": uid,
+                "summary": summary,
+                "location": location,
+                "description": description,
+                "start": dtstart,
+                "end": dtend,
+            })
+    return instances
 
-        if hasattr(dtend.dt, "timestamp"):
-            end_ts = int(dtend.dt.timestamp())
-        else:
-            end_ts = int(datetime.datetime.combine(dtend.dt, datetime.time()).timestamp())
+def insert_into_qalendar(events):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
 
-        events.append({
-            "type": TYPE_MAP[component.name],
-            "summary": summary,
-            "location": location,
-            "description": description,
-            "uid": uid,
-            "start": start_ts,
-            "end": end_ts,
-        })
+    cur.execute("SELECT CalendarId FROM Calendars LIMIT 1")
+    calendar_id = cur.fetchone()[0]
 
-    return events
+    inserted = 0
+    for ev in events:
+        uid = ev["uid"]
+        summary = ev["summary"]
+        location = ev["location"]
+        description = ev["description"]
+        start = int(ev["start"].timestamp())
+        end = int(ev["end"].timestamp())
 
-def insert_events(events):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    # Use CalendarId = 1 (DEFAULT_SYNC)
-    calendar_id = 1
-
-    count = 0
-    for e in events:
+        cur.execute("DELETE FROM Components WHERE Uid = ?", (uid,))
         cur.execute("""
             INSERT INTO Components (
-                CalendarId, ComponentType, Flags, DateStart, DateEnd,
-                Summary, Location, Description, Status, Uid,
-                Until, AllDay, CreatedTime, ModifiedTime, Tzid, TzOffset
+                CalendarId, ComponentType, Flags,
+                DateStart, DateEnd, Summary,
+                Location, Description, Status,
+                Uid, Until, AllDay,
+                CreatedTime, ModifiedTime, Tzid, TzOffset
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            calendar_id, e["type"], -1, e["start"], e["end"],
-            e["summary"], e["location"], e["description"], -1, e["uid"],
-            -1, 0, int(datetime.datetime.now().timestamp()), int(datetime.datetime.now().timestamp()),
+            calendar_id, 1, -1, start, end,
+            summary, location, description, 0,
+            uid, -1, 0,
+            int(time.time()), int(time.time()),
             ":Europe/Vienna", 7200
         ))
-        new_id = cur.lastrowid
-        cur.execute("INSERT INTO Instances (Id, DateStart, DateEnd) VALUES (?, ?, ?)",
-                    (new_id, e["start"], e["end"]))
-        count += 1
+        inserted += 1
 
-    conn.commit()
-    conn.close()
-    print(f"Imported {count} events successfully.")
+    con.commit()
+    con.close()
+    print(f"✅ Inserted {inserted} new event(s) into Qalendar.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python3 importics.py <file.ics>")
+        print("Usage: python3 importics.py path/to/file.ics")
         sys.exit(1)
 
-    events = parse_ics(sys.argv[1])
-    insert_events(events)
+    ics_path = sys.argv[1]
+    cal = parse_ics(ics_path)
+    events = expand_recurring_events(cal)
+    insert_into_qalendar(events)
