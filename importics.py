@@ -1,116 +1,88 @@
-import sys
 import sqlite3
 import time
-from datetime import datetime, timedelta, date, time as dtime
-from zoneinfo import ZoneInfo
 from pathlib import Path
-
-
-from icalendar import Calendar, Event
+from datetime import datetime, timedelta
 from dateutil.rrule import rrulestr
 from dateutil.tz import gettz
+from icalendar import Calendar
 
 DB_PATH = str(Path.home() / ".calendar" / "calendardb")
-TIMEZONE = ZoneInfo("Europe/Vienna")
+DEFAULT_TZ = gettz("Europe/Vienna")
 
-def parse_ics(path):
-    with open(path, "rb") as f:
-        return Calendar.from_ical(f.read())
-
-def expand_recurring_events(cal):
-    instances = []
-
-    for component in cal.walk():
+def expand_recurring_events(calendar):
+    expanded = []
+    for component in calendar.walk():
         if component.name != "VEVENT":
             continue
 
-        uid = str(component.get("UID"))
         summary = str(component.get("SUMMARY", ""))
-        location = str(component.get("LOCATION", ""))
-        description = str(component.get("DESCRIPTION", ""))
-        tzinfo = TIMEZONE
+        print(f"🌀 Recurring: {summary}")
 
         dtstart = component.get("DTSTART").dt
-        dtend = component.get("DTEND").dt if component.get("DTEND") else dtstart
+        dtend = component.get("DTEND").dt
 
-        if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
-            dtstart = datetime.combine(dtstart, dtime.min)
-        if isinstance(dtend, date) and not isinstance(dtend, datetime):
-            dtend = datetime.combine(dtend, dtime.min)
+        if isinstance(dtstart, datetime) and dtstart.tzinfo is None:
+            dtstart = dtstart.replace(tzinfo=DEFAULT_TZ)
+        elif not isinstance(dtstart, datetime):
+            dtstart = datetime.combine(dtstart, datetime.min.time(), tzinfo=DEFAULT_TZ)
 
-        dtstart = dtstart.replace(tzinfo=tzinfo)
-        dtend = dtend.replace(tzinfo=tzinfo)
+        if isinstance(dtend, datetime) and dtend.tzinfo is None:
+            dtend = dtend.replace(tzinfo=DEFAULT_TZ)
+        elif not isinstance(dtend, datetime):
+            dtend = datetime.combine(dtend, datetime.min.time(), tzinfo=DEFAULT_TZ)
 
-        rrule_raw = component.get("RRULE")
-        if rrule_raw:
-            try:
-                print(f"🌀 Recurring: {summary}")
-                rule = rrulestr(str(rrule_raw.to_ical().decode()), dtstart=dtstart)
-                exdates = component.get("EXDATE")
-                exclusions = set()
-                if exdates:
-                    if not isinstance(exdates, list):
-                        exdates = [exdates]
-                    for ex in exdates:
-                        for exval in ex.dts:
-                            exclusions.add(exval.dt.replace(tzinfo=tzinfo))
+        rrule_field = component.get("RRULE")
+        if not rrule_field:
+            expanded.append((summary, dtstart, dtend, str(component.get("UID"))))
+            continue
 
-                for recur_dt in rule:
-                    if recur_dt in exclusions:
-                        continue
-                    duration = dtend - dtstart
-                    instances.append({
-                        "uid": f"{uid}-{int(recur_dt.timestamp())}",
-                        "summary": summary,
-                        "location": location,
-                        "description": description,
-                        "start": recur_dt,
-                        "end": recur_dt + duration,
-                    })
-            except Exception as e:
-                print(f"⚠️  Failed to expand recurrence: {e}")
-        else:
-            instances.append({
-                "uid": uid,
-                "summary": summary,
-                "location": location,
-                "description": description,
-                "start": dtstart,
-                "end": dtend,
-            })
-    return instances
+        try:
+            rrule_str_val = "\n".join(
+                f"{key}={','.join(map(str, val))}" for key, val in rrule_field.items()
+                if isinstance(val, list)
+            )
+            rule = rrulestr(rrule_str_val, dtstart=dtstart)
+            exdates = []
+            for ex in component.get("EXDATE", []):
+                if hasattr(ex, "dts"):
+                    exdates.extend([dt.dt.replace(tzinfo=DEFAULT_TZ) for dt in ex.dts])
+            for occurrence_start in rule:
+                if occurrence_start in exdates:
+                    continue
+                delta = dtend - dtstart
+                occurrence_end = occurrence_start + delta
+                expanded.append((summary, occurrence_start, occurrence_end, str(component.get("UID")) + f"-{int(occurrence_start.timestamp())}"))
+        except Exception as e:
+            print(f"⚠️  Failed to expand recurrence: {e}")
+            continue
+    return expanded
 
-def insert_into_qalendar(events):
+def insert_into_qalendar(instances):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
     cur.execute("SELECT CalendarId FROM Calendars LIMIT 1")
-    calendar_id = cur.fetchone()[0]
+    cal_id = cur.fetchone()[0]
 
     inserted = 0
-    for ev in events:
-        uid = ev["uid"]
-        summary = ev["summary"]
-        location = ev["location"]
-        description = ev["description"]
-        start = int(ev["start"].timestamp())
-        end = int(ev["end"].timestamp())
+    for summary, start, end, uid in instances:
+        start_ts = int(start.timestamp())
+        end_ts = int(end.timestamp())
+        now = int(time.time())
 
+        # DELETE old instance with same UID before re-inserting (overwrite mode)
         cur.execute("DELETE FROM Components WHERE Uid = ?", (uid,))
+
         cur.execute("""
             INSERT INTO Components (
-                CalendarId, ComponentType, Flags,
-                DateStart, DateEnd, Summary,
-                Location, Description, Status,
-                Uid, Until, AllDay,
-                CreatedTime, ModifiedTime, Tzid, TzOffset
+                CalendarId, ComponentType, Flags, DateStart, DateEnd,
+                Summary, Location, Description, Status, Uid, Until,
+                AllDay, CreatedTime, ModifiedTime, Tzid, TzOffset
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            calendar_id, 1, -1, start, end,
-            summary, location, description, 0,
-            uid, -1, 0,
-            int(time.time()), int(time.time()),
-            ":Europe/Vienna", 7200
+            cal_id, 1, -1, start_ts, end_ts,
+            summary, "", "", -1, uid, -1,
+            0, now, now, ":Europe/Vienna", 7200
         ))
         inserted += 1
 
@@ -119,11 +91,8 @@ def insert_into_qalendar(events):
     print(f"✅ Inserted {inserted} new event(s) into Qalendar.")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python3 importics.py path/to/file.ics")
-        sys.exit(1)
-
-    ics_path = sys.argv[1]
-    cal = parse_ics(ics_path)
-    events = expand_recurring_events(cal)
-    insert_into_qalendar(events)
+    import sys
+    with open(sys.argv[1], "rb") as f:
+        cal = Calendar.from_ical(f.read())
+    instances = expand_recurring_events(cal)
+    insert_into_qalendar(instances)
